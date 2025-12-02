@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI News Research & Idea Generator</title>
+
+    <!-- Google Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f2f4f7;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            font-weight: 700;
+        }
+
+        #keywords {
+            width: 100%;
+            height: 120px;
+            padding: 14px;
+            font-size: 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            outline: none;
+            resize: none;
+        }
+
+        #generateBtn {
+            margin-top: 20px;
+            display: block;
+            width: 220px;
+            padding: 14px;
+            font-size: 17px;
+            background-color: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: auto;
+            margin-right: auto;
+            font-weight: 600;
+        }
+
+        #generateBtn:hover {
+            background-color: #2563eb;
+        }
+
+        #loading {
+            display: none;
+            text-align: center;
+            color: #555;
+            margin-top: 20px;
+        }
+
+        #results {
+            margin-top: 35px;
+        }
+
+        .idea-card {
+            background: #eef2ff;
+            padding: 14px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border-left: 5px solid #6366f1;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>📰 AI News Research & Idea Generator</h1>
+
+        <textarea id="keywords" placeholder="Enter keywords... Example: AI tools, Samsung TV, EV cars"></textarea>
+
+        <button id="generateBtn" onclick="generateIdeas()">Generate Ideas</button>
+
+        <div id="loading">⏳ Processing... please wait...</div>
+
+        <div id="results"></div>
+    </div>
+
+    <script>
+        async function generateIdeas() {
+            const keyword = document.getElementById("keywords").value.trim();
+            const loading = document.getElementById("loading");
+            const results = document.getElementById("results");
+
+            if (!keyword) {
+                alert("Please enter a keyword.");
+                return;
+            }
+
+            loading.style.display = "block";
+            results.innerHTML = "";
+
+            try {
+                const response = await fetch("http://127.0.0.1:8000/api/v1/scrape-and-generate", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ keywords: [keyword] })
+                });
+
+                const data = await response.json();
+                loading.style.display = "none";
+
+                if (!data.ideas || data.ideas.length === 0) {
+                    results.innerHTML = "<p>No ideas generated.</p>";
+                    return;
+                }
+
+                let html = "";
+                data.ideas.forEach((idea, i) => {
+                    html += `<div class="idea-card"><b>${i + 1}.</b> ${idea}</div>`;
+                });
+
+                results.innerHTML = html;
+
+            } catch (error) {
+                loading.style.display = "none";
+                results.innerHTML = "<p style='color:red;'>Error: Unable to fetch data.</p>";
+                console.error(error);
+            }
+        }
+    </script>
+
+</body>
+</html>
