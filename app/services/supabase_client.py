@@ -69,6 +69,36 @@ class SupabaseClient:
 
         response.raise_for_status()
         return response.json()
+    
+        # ----------------------------------------------------
+    # FETCH ONE ROW BY COLUMN MATCH
+    # Example: fetch_one("articles", {"url": "https://example.com"})
+    # ----------------------------------------------------
+    async def fetch_one(self, table: str, filters: dict):
+        """
+        Fetch a single row matching the given filters.
+        filters = {"url": "..."}  → converted to: url=eq.<value>
+        """
+        query_parts = []
+
+        for col, value in filters.items():
+            query_parts.append(f"{col}=eq.{value}")
+
+        query = "&".join(query_parts)
+
+        url = f"{self.base_url}/{table}?{query}&select=*"
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, headers=self.headers)
+
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+
+        return None
+
 
     # ----------------------------------------------------
     # UPDATE ROWS

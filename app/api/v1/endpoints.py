@@ -1,28 +1,18 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Optional, List
 
 from app.services.llm_client import GeminiClient
 from app.services.idea_generator import IdeaGenerator
 from app.services.scraper import Scraper
-from typing import Optional
 
 router = APIRouter(prefix="/api/v1")
 
-
-# -------------------------
-# Request Models
-# -------------------------
 class ExpandRequest(BaseModel):
-    keywords: list[str]
-
+    keywords: List[str]
 
 class ScrapeRequest(BaseModel):
-    keywords: list[str]
-
-
-# -------------------------
-# Response Models
-# -------------------------
+    keywords: List[str]
 
 class ArticleOut(BaseModel):
     url: str
@@ -30,18 +20,14 @@ class ArticleOut(BaseModel):
     summary: Optional[str]
     snippet: Optional[str]
 
-
 class CombinedResponse(BaseModel):
-    seed_keywords: list[str]
-    expanded_keywords: list[str]
+    seed_keywords: List[str]
+    expanded_keywords: List[str]
     saved_articles: int
-    ideas: list[str]
+    ideas: List[str]
 
 
-
-# -------------------------
-# 1. Expand keywords
-# -------------------------
+# ---------------- 1. Expand keywords ----------------
 @router.post("/expand")
 async def expand_keywords(payload: ExpandRequest):
     if not payload.keywords:
@@ -49,25 +35,23 @@ async def expand_keywords(payload: ExpandRequest):
 
     gemini = GeminiClient()
     expanded = await gemini.expand_keywords(payload.keywords)
+    expanded = expanded[:10]  # cap to prevent overload
+
     return {"expanded_keywords": expanded}
 
 
-# -------------------------
-# 2. SCRAPE ONLY (NO ideas)
-# -------------------------
-@router.post("/scrape", response_model=list[ArticleOut])
+# ---------------- 2. Scrape only ----------------
+@router.post("/scrape", response_model=List[ArticleOut])
 async def scrape_data(payload: ScrapeRequest):
     if not payload.keywords:
         raise HTTPException(400, "Keywords cannot be empty")
 
     scraper = Scraper()
-
     all_articles = []
 
     for kw in payload.keywords:
         scraped = await scraper.search_and_scrape(kw)
 
-        # CLEAN OUTPUT (no raw_html)
         cleaned = [
             {
                 "url": art["url"],
@@ -75,36 +59,31 @@ async def scrape_data(payload: ScrapeRequest):
                 "summary": art["summary"],
                 "snippet": art["snippet"],
             }
-            for art in scraped
+            for art in scraped if art.get("summary")
         ]
 
-        all_articles.extend(cleaned)
+        all_articles.extend(cleaned[:2])  # top 2 cleaned
 
     return all_articles
 
 
-# -------------------------
-# 3. Get stored articles
-# -------------------------
-@router.get("/articles", response_model=list[ArticleOut])
+# ---------------- 3. Get stored articles ----------------
+@router.get("/articles", response_model=List[ArticleOut])
 async def get_articles():
     idea = IdeaGenerator()
     return await idea.get_all_articles()
 
 
-# -------------------------
-# 4. Generate ideas from saved articles
-# -------------------------
-@router.get("/ideas", response_model=list[str])
-async def generate_ideas():
+# ---------------- 4. Generate ideas ----------------
+@router.get("/ideas", response_model=List[str])
+async def generate_ideas(keyword: str = None):
     idea = IdeaGenerator()
+    if keyword:
+        return await idea.generate_ideas_by_keyword(keyword)
     return await idea.generate_ideas()
 
 
-# -------------------------
-# 5. FULL PIPELINE:
-#    expand → scrape → store → generate ideas
-# -------------------------
+# ---------------- 5. Scrape & Generate pipeline ----------------
 @router.post("/scrape-and-generate", response_model=CombinedResponse)
 async def scrape_and_generate(payload: ScrapeRequest):
     if not payload.keywords:
@@ -114,16 +93,17 @@ async def scrape_and_generate(payload: ScrapeRequest):
     scraper = Scraper()
     idea = IdeaGenerator()
 
-    # 1) Expand keywords
     expanded = await gemini.expand_keywords(payload.keywords)
+    expanded = expanded[:5]
 
-    all_articles = []
+    all_cleaned = []
+    saved_count = 0
 
-    # 2) Scrape using expanded keywords
+    seed_keyword = payload.keywords[0]
+
     for kw in expanded:
         scraped = await scraper.search_and_scrape(kw)
 
-        # Save cleaned output for response
         cleaned = [
             {
                 "url": art["url"],
@@ -131,20 +111,35 @@ async def scrape_and_generate(payload: ScrapeRequest):
                 "summary": art["summary"],
                 "snippet": art["snippet"],
             }
-            for art in scraped
+            for art in scraped if art.get("summary")
         ]
-        all_articles.extend(cleaned)
 
-        # Save raw data to Supabase
-        for art in scraped:
-            await idea.save_article(art)
+        cleaned = cleaned[:10]  # consistent limit
 
-    # 3) Generate fresh article ideas
-    ideas = await idea.generate_ideas()
+        # semantic filtering BEFORE saving
+        relevant = idea.semantic.find_relevant(seed_keyword, cleaned, top_k=5)
 
-    return {
-        "seed_keywords": payload.keywords,
-        "expanded_keywords": expanded,
-        "saved_articles": len(all_articles),
-        "ideas": ideas
-    }
+        all_cleaned.extend(relevant)
+
+        # save only relevant & unique
+        for art in relevant:
+            inserted = await idea.save_article(art)
+            if inserted:
+                saved_count += 1
+
+    if not all_cleaned:
+        return CombinedResponse(
+            seed_keywords=payload.keywords,
+            expanded_keywords=expanded,
+            saved_articles=0,
+            ideas=["No articles scraped. Try different keywords."]
+        )
+
+    ideas = await idea.generate_ideas_from_list(all_cleaned)
+
+    return CombinedResponse(
+        seed_keywords=payload.keywords,
+        expanded_keywords=expanded,
+        saved_articles=saved_count,
+        ideas=ideas
+    )

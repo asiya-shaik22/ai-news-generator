@@ -1,5 +1,6 @@
 # app/services/scraper.py
 
+import asyncio
 import httpx
 import feedparser
 from bs4 import BeautifulSoup
@@ -155,39 +156,41 @@ class Scraper:
     # ------------------------------------------------------------
     # 5) Combined Search: RSS first → HTML fallback
     # ------------------------------------------------------------
-    async def search_and_scrape(self, keyword: str) -> list[dict]:
+ 
 
-        # Step 1 — Try RSS (best)
+    async def search_and_scrape(self, keyword: str) -> list[dict]:
+        """
+        Final optimized workflow:
+        1. Try RSS search (fast, real links)
+        2. If RSS empty → fallback to HTML search
+        3. Scrape top 5 URLs concurrently using asyncio.gather
+        """
+
+        # 1️⃣ Try RSS
         urls = await self.search_rss(keyword)
 
-        # Step 2 — Fallback to HTML (if RSS fails)
+        # 2️⃣ If RSS returned nothing → use HTML search as fallback
         if not urls:
-            print("⚠️ RSS returned zero results → using HTML fallback")
+            print("⚠ RSS failed — using HTML search fallback")
             urls = await self.search_html(keyword)
 
+        if not urls:
+            print("❌ No URLs found from either RSS or HTML")
+            return []
+
+        # Limit to top 5 URLs
+        urls = urls[:5]
+
+        # 3️⃣ Run scrapers concurrently
+        tasks = [self.scrape_article(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 4️⃣ Filter out errors
         articles = []
-
-        for url in urls[:5]:
-        # ------------------------------------------------
-        # STEP 1 — Check if article already exists in DB
-        # ------------------------------------------------
-            try:
-                existing = await db.fetch_by_query("articles", f"url=eq.{url}")
-                if existing:
-                    # already saved earlier → skip scraping
-                    # OPTIONAL: remove log noise
-                    # print("Skipping existing URL:", url)
-                    continue
-            except Exception:
-                pass  # if DB check fails, still try scraping
-
-            # ------------------------------------------------
-            # STEP 2 — Scrape if not already in DB
-            # ------------------------------------------------
-            try:
-                data = await self.scrape_article(url)
-                articles.append(data)
-            except Exception as e:
-                print("Error scraping:", url, e)
+        for r in results:
+            if isinstance(r, dict):
+                articles.append(r)
+            else:
+                print("Scrape error:", r)
 
         return articles

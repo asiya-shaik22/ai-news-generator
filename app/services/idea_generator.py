@@ -1,92 +1,82 @@
-
+from app.services.semantic_engine import SemanticEngine
 from app.services.supabase_client import SupabaseClient
 from app.services.llm_client import GeminiClient
-
 
 class IdeaGenerator:
     def __init__(self):
         self.db = SupabaseClient()
         self.gemini = GeminiClient()
+        self.semantic = SemanticEngine()
 
-    # ----------------------------------------------------
-    # SAVE ARTICLE (with safe text limits)
-    # ----------------------------------------------------
     async def save_article(self, article: dict):
-
-        title = (article.get("title") or "")[:500]
-        summary = (article.get("summary") or "")[:2000]   # reduced for speed
-        snippet = (article.get("snippet") or "")[:300]
+        # avoid duplicate inserts
+        exists = await self.db.fetch_one("articles", {"url": article.get("url")})
+        if exists:
+            return None
 
         data = {
             "url": article.get("url"),
-            "title": title,
-            "summary": summary,
-            "snippet": snippet,
-            "raw_html": (article.get("raw_html") or "")[:20000],  # trim HTML
+            "title": (article.get("title") or "")[:500],
+            "summary": (article.get("summary") or "")[:2000],
+            "snippet": (article.get("snippet") or "")[:300],
         }
 
         return await self.db.insert("articles", data)
-    
-    
-    # ----------------------------------------------------
-    # FETCH ALL ARTICLES (for /articles endpoint)
-    # ----------------------------------------------------
+
     async def get_all_articles(self):
         return await self.db.fetch_all("articles")
 
-
-    # ----------------------------------------------------
-    # FETCH ONLY LATEST 20 ARTICLES (super fast)
-    # ----------------------------------------------------
     async def get_recent_articles(self, limit: int = 20):
-        """
-        Load only the most recent articles instead of entire DB.
-        Speeds up the LLM prompt significantly.
-        """
-
         query = f"select=*&order=created_at.desc&limit={limit}"
         return await self.db.fetch_all(f"articles?{query}")
 
-    # ----------------------------------------------------
-    # GENERATE IDEAS FROM ARTICLES
-    # ----------------------------------------------------
     async def generate_ideas(self):
-
-        # 1) Fetch only latest 20 articles
-        articles = await self.get_recent_articles(limit=20)
-
+        articles = await self.get_recent_articles(limit=5)
         if not articles:
             return ["No articles found. Please scrape first."]
 
-        # 2) Build trimmed context
-        context_parts = []
-        for a in articles:
-            title = (a.get("title") or "").strip()
-            summary = (a.get("summary") or "").strip()
+        context = "\n\n".join(
+            f"Title: {a.get('title')}\nSummary: {(a.get('summary') or '')[:1000]}"
+            for a in articles
+        )
 
-            # reduce per-article summary size
-            summary = summary[:400]
-
-            context_parts.append(f"Title: {title}\nSummary: {summary}")
-
-        context = "\n\n".join(context_parts)
-
-        # 3) Final prompt
         prompt = (
-            "Use the following news article summaries to generate 5 fresh, "
-            "unique, trending news article ideas.\n"
-            "Keep ideas short, clear, and interesting.\n\n"
+            "Use the following news summaries to generate 5 fresh short article ideas.\n\n"
             f"{context}"
         )
 
-        # 4) Send to Gemini
         ideas_text = await self.gemini.raw_prompt(prompt)
+        ideas = [i.strip("•-● ").strip() for i in ideas_text.split("\n") if i.strip()]
+        return ideas[:10]
 
-        # 5) Clean and convert to list
-        ideas = [
-            i.strip("•-● ").strip()
-            for i in ideas_text.split("\n")
-            if i.strip()
-        ]
+    async def generate_ideas_from_list(self, articles: list[dict]):
+        if not articles:
+            return ["No relevant articles found for this keyword."]
 
-        return ideas[:10]   # return top 10 ideas
+        context = "\n\n".join(
+            f"Title: {a.get('title')}\nSummary: {(a.get('summary') or '')[:1000]}"
+            for a in articles
+        )
+
+        prompt = (
+            "Using the following summaries, generate 5 concise news article ideas:\n\n"
+            f"{context}"
+        )
+
+        ideas_text = await self.gemini.raw_prompt(prompt)
+        ideas = [i.strip("•-● ").strip() for i in ideas_text.split("\n") if i.strip()]
+        return ideas[:10]
+
+    async def generate_ideas_by_keyword(self, keyword: str):
+        if not keyword:
+            return ["Keyword required"]
+
+        all_articles = await self.db.fetch_all("articles")
+        if not all_articles:
+            return [f"No articles found for '{keyword}'"]
+
+        relevant = self.semantic.find_relevant(keyword, all_articles, top_k=10)
+        if not relevant:
+            return [f"No relevant articles found for '{keyword}'"]
+
+        return await self.generate_ideas_from_list(relevant)
