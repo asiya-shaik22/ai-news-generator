@@ -94,7 +94,7 @@ async def scrape_and_generate(payload: ScrapeRequest):
     idea = IdeaGenerator()
 
     expanded = await gemini.expand_keywords(payload.keywords)
-    expanded = expanded[:5]
+    expanded = expanded[:10]
 
     all_cleaned = []
     saved_count = 0
@@ -117,12 +117,12 @@ async def scrape_and_generate(payload: ScrapeRequest):
         cleaned = cleaned[:10]  # consistent limit
 
         # semantic filtering BEFORE saving
-        relevant = idea.semantic.find_relevant(seed_keyword, cleaned, top_k=5)
+        relevant = idea.semantic.find_relevant(seed_keyword, cleaned, top_k=10)
 
         all_cleaned.extend(relevant)
 
         # save only relevant & unique
-        for art in relevant:
+        for art in relevant[:5]:
             inserted = await idea.save_article(art)
             if inserted:
                 saved_count += 1
