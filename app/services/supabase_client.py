@@ -16,7 +16,7 @@ class SupabaseClient:
             "apikey": settings.supabase_key,
             "Authorization": f"Bearer {settings.supabase_key}",
             "Content-Type": "application/json",
-            "Prefer": "return=representation"   # 👈 this ensures Supabase returns JSON
+            "Prefer": "return=representation,resolution=ignore-duplicates"   # 👈 this ensures Supabase returns JSON
         }
 
     # ----------------------------------------------------

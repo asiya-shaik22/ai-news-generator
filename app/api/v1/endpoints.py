@@ -8,11 +8,15 @@ from app.services.scraper import Scraper
 
 router = APIRouter(prefix="/api/v1")
 
+
+# ---------------- Models ----------------
 class ExpandRequest(BaseModel):
     keywords: List[str]
 
+
 class ScrapeRequest(BaseModel):
     keywords: List[str]
+
 
 class ArticleOut(BaseModel):
     url: str
@@ -20,11 +24,17 @@ class ArticleOut(BaseModel):
     summary: Optional[str]
     snippet: Optional[str]
 
+
 class CombinedResponse(BaseModel):
     seed_keywords: List[str]
     expanded_keywords: List[str]
-    saved_articles: int
     ideas: List[str]
+
+
+# ---------------- Helpers / Defaults ----------------
+# Global caps to avoid DB bloat and API overuse
+MAX_SAVE_PER_RUN = 10   # total articles to save per pipeline run (change to 5 if you prefer)
+FULL_FETCH_TOP = 3      # number of top articles to fetch full HTML for richer summary
 
 
 # ---------------- 1. Expand keywords ----------------
@@ -35,14 +45,16 @@ async def expand_keywords(payload: ExpandRequest):
 
     gemini = GeminiClient()
     expanded = await gemini.expand_keywords(payload.keywords)
-    expanded = expanded[:10]  # cap to prevent overload
-
-    return {"expanded_keywords": expanded}
+    return {"expanded_keywords": expanded[:10]}
 
 
 # ---------------- 2. Scrape only ----------------
 @router.post("/scrape", response_model=List[ArticleOut])
 async def scrape_data(payload: ScrapeRequest):
+    """
+    Scrape and return articles (doesn't save). Uses the Scraper service.
+    This endpoint returns up to 5 article objects per keyword (adjustable).
+    """
     if not payload.keywords:
         raise HTTPException(400, "Keywords cannot be empty")
 
@@ -52,26 +64,32 @@ async def scrape_data(payload: ScrapeRequest):
     for kw in payload.keywords:
         scraped = await scraper.search_and_scrape(kw)
 
+        # Prefer snippet from SerpAPI (if using SerpAPI). Accept fallback text.
         cleaned = [
             {
-                "url": art["url"],
-                "title": art["title"],
-                "summary": art["summary"],
-                "snippet": art["snippet"],
+                "url": art.get("url"),
+                "title": art.get("title") or "Untitled",
+                "summary": art.get("summary") or art.get("snippet") or "Short summary not available.",
+                "snippet": art.get("snippet") or "",
             }
-            for art in scraped if art.get("summary")
+            for art in scraped if art.get("url")
         ]
 
-        all_articles.extend(cleaned[:2])  # top 2 cleaned
+        # keep a few per keyword for preview
+        all_articles.extend(cleaned[:5])
 
     return all_articles
 
 
 # ---------------- 3. Get stored articles ----------------
 @router.get("/articles", response_model=List[ArticleOut])
-async def get_articles():
+async def get_articles(limit: int = 10):
+    """
+    Return recent saved articles. Default limit is 10 (adjustable via query param).
+    This ensures Swagger shows recent meaningful rows.
+    """
     idea = IdeaGenerator()
-    return await idea.get_all_articles()
+    return await idea.get_recent_articles(limit=limit)
 
 
 # ---------------- 4. Generate ideas ----------------
@@ -86,6 +104,7 @@ async def generate_ideas(keyword: str = None):
 # ---------------- 5. Scrape & Generate pipeline ----------------
 @router.post("/scrape-and-generate", response_model=CombinedResponse)
 async def scrape_and_generate(payload: ScrapeRequest):
+
     if not payload.keywords:
         raise HTTPException(400, "Keywords cannot be empty")
 
@@ -96,50 +115,60 @@ async def scrape_and_generate(payload: ScrapeRequest):
     expanded = await gemini.expand_keywords(payload.keywords)
     expanded = expanded[:10]
 
-    all_cleaned = []
-    saved_count = 0
+    seed = payload.keywords[0]
 
-    seed_keyword = payload.keywords[0]
+    saved_urls = set()
+    saved_articles_list = []   # used only for idea generation
 
+    # SIMPLE FIX: scrape + save max 10
     for kw in expanded:
+
+        if len(saved_urls) >= MAX_SAVE_PER_RUN:
+            break
+
         scraped = await scraper.search_and_scrape(kw)
 
-        cleaned = [
-            {
-                "url": art["url"],
-                "title": art["title"],
-                "summary": art["summary"],
-                "snippet": art["snippet"],
-            }
-            for art in scraped if art.get("summary")
-        ]
+        for art in scraped:
 
-        cleaned = cleaned[:10]  # consistent limit
+            if len(saved_urls) >= 10:
+                break
 
-        # semantic filtering BEFORE saving
-        relevant = idea.semantic.find_relevant(seed_keyword, cleaned, top_k=10)
+            url = art.get("url")
+            if not url or url in saved_urls:
+                continue
 
-        all_cleaned.extend(relevant)
-
-        # save only relevant & unique
-        for art in relevant[:5]:
+            # insert directly (no summary checks, no semantic checks)
             inserted = await idea.save_article(art)
-            if inserted:
-                saved_count += 1
 
-    if not all_cleaned:
+            
+            # print("DEBUG INSERT RESPONSE:", inserted, "TYPE:", type(inserted))
+
+            # If duplicate (409 case) → skip
+            if isinstance(inserted, dict) and inserted.get("status") == "duplicate":
+                continue
+
+            # If inserted new row → list
+            if isinstance(inserted, list):
+                saved_urls.add(url)
+                saved_articles_list.append(art)
+
+                # print("SAVED COUNT:", len(saved_urls))
+
+
+
+    # No articles scraped
+    if not saved_articles_list:
         return CombinedResponse(
             seed_keywords=payload.keywords,
             expanded_keywords=expanded,
-            saved_articles=0,
             ideas=["No articles scraped. Try different keywords."]
         )
 
-    ideas = await idea.generate_ideas_from_list(all_cleaned)
+    # Generate ideas
+    ideas = await idea.generate_ideas_from_list(saved_articles_list)
 
     return CombinedResponse(
         seed_keywords=payload.keywords,
         expanded_keywords=expanded,
-        saved_articles=saved_count,
         ideas=ideas
     )

@@ -1,196 +1,83 @@
 # app/services/scraper.py
+# SerpApi-backed scraper (async, safe)
+# Returns list[dict]: {url, title, summary, snippet, raw_html}
 
 import asyncio
 import httpx
-import feedparser
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, quote, urljoin
-from readability import Document
+import os
+from urllib.parse import quote, unquote
+from app.config import settings  # assume you added serpapi_key etc here
 
-GOOGLE_NEWS = "https://news.google.com"
+SERPAPI_BASE = "https://serpapi.com/search.json"
 
 
 class Scraper:
+    def __init__(self):
+        # prefer settings; fallback to env
+        self.api_key = getattr(settings, "serpapi_key", None) or os.getenv("SERPAPI_KEY")
+        self.engine = getattr(settings, "serpapi_engine", "google_news")
+        self.region = getattr(settings, "serpapi_region", "IN")
+        self.language = getattr(settings, "serpapi_language", "en")
 
-    # ------------------------------------------------------------
-    # 1) RSS Search (Fastest & Most Reliable)
-    # ------------------------------------------------------------
-    async def search_rss(self, keyword: str) -> list[str]:
-        encoded = quote(keyword)
+        if not self.api_key:
+            raise RuntimeError("SERPAPI_KEY is required in environment or settings")
 
-        rss_url = (
-            f"https://news.google.com/rss/search?q={encoded}"
-            f"&hl=en-IN&gl=IN&ceid=IN:en"
-        )
+        # Default HTTP timeout
+        self._timeout = 20
 
-        feed = feedparser.parse(rss_url)
-        urls = []
-
-        for entry in feed.entries:
-
-            # Best source — real publisher link
-            if "feedburner_origlink" in entry:
-                urls.append(entry.feedburner_origlink)
-                continue
-
-            # GUID sometimes contains the real link
-            if getattr(entry, "guid", "").startswith("http"):
-                urls.append(entry.guid)
-                continue
-
-            # Source link
-            if hasattr(entry, "source") and hasattr(entry.source, "href"):
-                urls.append(entry.source.href)
-                continue
-
-            # Default Google redirect link
-            if hasattr(entry, "link"):
-                urls.append(entry.link)
-                continue
-
-            # Very rare fallback
-            try:
-                urls.append(entry.links[0]["href"])
-            except:
-                pass
-
-        # Remove duplicates
-        return list(dict.fromkeys(urls))
-
-    # ------------------------------------------------------------
-    # 2) HTML Search (when RSS returns empty)
-    # ------------------------------------------------------------
-    async def search_html(self, keyword: str) -> list[str]:
-
-        search_url = (
-            f"{GOOGLE_NEWS}/search?q={quote(keyword)}"
-            f"&hl=en-IN&gl=IN&ceid=IN:en"
-        )
-
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
-            timeout=20
-        ) as client:
-            r = await client.get(search_url)
-
-        soup = BeautifulSoup(r.text, "lxml")
-
-        selectors = [
-            "article h3 a",
-            "h3 a",
-            "a.WwrzSb",
-            "a.ipQwMb",
-            "a.VDXfz",
-        ]
-
-        urls = []
-
-        for sel in selectors:
-            for a in soup.select(sel):
-                link = a.get("href")
-                if not link:
-                    continue
-
-                # Convert ./article/... to absolute
-                if link.startswith("./"):
-                    full = urljoin(GOOGLE_NEWS, link[2:])
-                else:
-                    full = urljoin(GOOGLE_NEWS, link)
-
-                urls.append(full)
-
-        return list(dict.fromkeys(urls))
-
-    # ------------------------------------------------------------
-    # 3) Extract real URL from Google redirect
-    # ------------------------------------------------------------
-    def extract_real_url(self, url: str) -> str:
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-
-        # https://news.google.com/... ?url=https://actual.com
-        if "url" in query:
-            return query["url"][0]
-
-        return url
-
-    # ------------------------------------------------------------
-    # 4) Scrape Real Article Content
-    # ------------------------------------------------------------
-    async def scrape_article(self, url: str) -> dict:
-
-        real_url = self.extract_real_url(url)
-
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
-            timeout=20
-        ) as client:
-            r = await client.get(real_url)
-
-        html = r.text
-
-        try:
-            doc = Document(html)
-        except:
-            raise Exception("Readability failed")
-
-        title = doc.title() or "Untitled Article"
-        summary_html = doc.summary()
-
-        soup = BeautifulSoup(summary_html, "lxml")
-        clean_text = soup.get_text(" ", strip=True)
-
-        sentences = clean_text.split(". ")
-        snippet = ". ".join(sentences[:2]).strip() + "."
-
-        return {
-            "url": real_url,
-            "title": title[:500],
-            "summary": clean_text[:5000],
-            "snippet": snippet[:500],
-            "raw_html": html
+    async def _call_serpapi(self, query: str, num: int = 5) -> dict:
+        """
+        Call SerpApi/google_news endpoint and return parsed JSON.
+        """
+        params = {
+            "engine": self.engine,
+            "q": query,
+            "hl": self.language,
+            "gl": self.region,
+            "api_key": self.api_key,
+            # SerpApi supports a 'num' param for some engines; we'll limit locally
         }
 
-    # ------------------------------------------------------------
-    # 5) Combined Search: RSS first → HTML fallback
-    # ------------------------------------------------------------
- 
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(SERPAPI_BASE, params=params)
+        resp.raise_for_status()
+        return resp.json()
 
     async def search_and_scrape(self, keyword: str) -> list[dict]:
         """
-        Final optimized workflow:
-        1. Try RSS search (fast, real links)
-        2. If RSS empty → fallback to HTML search
-        3. Scrape top 5 URLs concurrently using asyncio.gather
+        Main entry used by rest of pipeline.
+        Uses SerpApi to fetch news results and returns normalized list:
+        [{url, title, summary, snippet, raw_html}]
         """
-
-        # 1️⃣ Try RSS
-        urls = await self.search_rss(keyword)
-
-        # 2️⃣ If RSS returned nothing → use HTML search as fallback
-        if not urls:
-            print("⚠ RSS failed — using HTML search fallback")
-            urls = await self.search_html(keyword)
-
-        if not urls:
-            print("❌ No URLs found from either RSS or HTML")
+        try:
+            data = await self._call_serpapi(keyword, num=10)
+        except Exception as e:
+            print("SerpApi error:", type(e), str(e))
             return []
 
-        # Limit to top 5 URLs
-        urls = urls[:5]
+        results = []
 
-        # 3️⃣ Run scrapers concurrently
-        tasks = [self.scrape_article(url) for url in urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # The google_news engine returns "news_results" (list) in SerpApi responses.
+        # See: https://serpapi.com/google-news-api
+        news_items = data.get("news_results") or data.get("news") or []
 
-        # 4️⃣ Filter out errors
-        articles = []
-        for r in results:
-            if isinstance(r, dict):
-                articles.append(r)
-            else:
-                print("Scrape error:", r)
+        for item in news_items[:10]:  # cap results
+            link = item.get("link") or item.get("source_url") or item.get("url")
+            title = item.get("title") or item.get("headline") or ""
+            snippet = item.get("snippet") or item.get("snippet_text") or ""
+            # Use snippet as summary to avoid fetching the whole page.
+            summary = snippet if snippet else item.get("abstract") or ""
 
-        return articles
+            # normalize
+            if link:
+                link = unquote(link)
+
+            results.append({
+                "url": link,
+                "title": title,
+                "summary": summary,
+                "snippet": snippet,
+                "raw_html": None  # we are not fetching article HTML here
+            })
+
+        return results
